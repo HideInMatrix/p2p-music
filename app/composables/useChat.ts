@@ -26,9 +26,15 @@ export function useChat(room: string, name: string) {
        RTCPeerConnection
     ======================== */
 
+    const config = useRuntimeConfig();
     const pc = new RTCPeerConnection({
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
+            {
+                urls: config.public.turnUrl,
+                username: config.public.turnUser,
+                credential: config.public.turnPassword
+            }
             // ⚠️ 生产环境必须加 TURN
         ]
     })
