@@ -1,46 +1,136 @@
-import { ref } from 'vue'
+import { ref, shallowRef } from 'vue'
 import { useWsClient } from './useWsClient'
 
 export function useChat(room: string, name: string) {
+    /* ========================
+       状态
+    ======================== */
+
     const messages = ref<{ name: string; message: string }[]>([])
+
+    const localStream = shallowRef<MediaStream | null>(null)
+    const remoteStream = shallowRef<MediaStream | null>(null)
+
+    const isChannelOpen = ref(false)
+    const connectionState = ref<
+        'idle' | 'connecting' | 'connected' | 'failed'
+    >('idle')
+
+    /* ========================
+       WebSocket 信令
+    ======================== */
+
     const { send: sendSignal, onMessage } = useWsClient()
 
+    /* ========================
+       RTCPeerConnection
+    ======================== */
+
     const pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            // ⚠️ 生产环境必须加 TURN
+        ]
     })
 
-    let channel: RTCDataChannel | null = null
     let started = false
+    let channel: RTCDataChannel | null = null
 
-    /* ===== 接收 DataChannel ===== */
-    pc.ondatachannel = (event) => {
-        channel = event.channel
-        bindChannel()
+    /* ========================
+       DataChannel
+    ======================== */
+
+    function bindDataChannel() {
+        if (!channel) return
+
+        channel.onopen = () => {
+            isChannelOpen.value = true
+            connectionState.value = 'connected'
+            console.log('[DataChannel] open')
+        }
+
+        channel.onclose = () => {
+            isChannelOpen.value = false
+            connectionState.value = 'failed'
+        }
+
+        channel.onerror = (e) => {
+            console.error('[DataChannel] error', e)
+            connectionState.value = 'failed'
+        }
+
+        channel.onmessage = (e) => {
+            messages.value.push(JSON.parse(e.data))
+        }
     }
 
-    /* ===== ICE ===== */
-    pc.onicecandidate = (event) => {
-        if (event.candidate) {
+    pc.ondatachannel = (e) => {
+        channel = e.channel
+        bindDataChannel()
+    }
+
+    /* ========================
+       ICE
+    ======================== */
+
+    pc.onicecandidate = (e) => {
+        if (e.candidate) {
             sendSignal({
                 type: 'signal',
                 room,
-                data: { ice: event.candidate }
+                data: { ice: e.candidate }
             })
         }
     }
 
-    /* ===== 信令 ===== */
+    pc.oniceconnectionstatechange = () => {
+        console.log('[ICE]', pc.iceConnectionState)
+        if (pc.iceConnectionState === 'failed') {
+            connectionState.value = 'failed'
+        }
+    }
+
+    /* ========================
+       Media Track
+    ======================== */
+
+    pc.ontrack = (e) => {
+        if (!remoteStream.value) {
+            remoteStream.value = new MediaStream()
+        }
+        remoteStream.value.addTrack(e.track)
+    }
+
+    async function initLocalMedia() {
+        if (localStream.value) return
+
+        localStream.value = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true
+        })
+
+        // ⚠️ Safari / iOS 必须在 createOffer 前 addTrack
+        localStream.value.getTracks().forEach((track) => {
+            pc.addTrack(track, localStream.value!)
+        })
+    }
+
+    /* ========================
+       信令处理
+    ======================== */
+
     onMessage(async (msg) => {
         if (msg.type !== 'signal') return
 
         const data = msg.data
 
-        // 被动收到 offer（非房主）
         if (data.offer && !started) {
             started = true
+            connectionState.value = 'connecting'
+
+            // await initLocalMedia()
 
             await pc.setRemoteDescription(data.offer)
-
             const answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
 
@@ -51,7 +141,6 @@ export function useChat(room: string, name: string) {
             })
         }
 
-        // 主动方收到 answer
         if (data.answer) {
             await pc.setRemoteDescription(data.answer)
         }
@@ -61,20 +150,20 @@ export function useChat(room: string, name: string) {
         }
     })
 
-    function bindChannel() {
-        if (!channel) return
-        channel.onmessage = (e) => {
-            messages.value.push(JSON.parse(e.data))
-        }
-    }
+    /* ========================
+       主动发起（房主）
+    ======================== */
 
-    /* ===== 主动发起（由外部控制） ===== */
     async function start() {
         if (started) return
+
         started = true
+        connectionState.value = 'connecting'
+
+        // await initLocalMedia()
 
         channel = pc.createDataChannel('chat')
-        bindChannel()
+        bindDataChannel()
 
         const offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
@@ -86,6 +175,10 @@ export function useChat(room: string, name: string) {
         })
     }
 
+    /* ========================
+       发送消息
+    ======================== */
+
     function sendMessage(text: string) {
         if (!channel || channel.readyState !== 'open') return
 
@@ -95,8 +188,17 @@ export function useChat(room: string, name: string) {
     }
 
     return {
+        /* 聊天 */
         messages,
+        sendMessage,
+
+        /* 视频 */
+        localStream,
+        remoteStream,
+
+        /* 连接 */
         start,
-        sendMessage
+        isChannelOpen,
+        connectionState
     }
 }
